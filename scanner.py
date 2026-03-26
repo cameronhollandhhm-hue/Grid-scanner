@@ -5,7 +5,9 @@ TELEGRAM_BOT_TOKEN = "8785724347:AAFELFIZtKT1PSo5PLsg-4EHCBS_5IlLqLA"
 TELEGRAM_CHAT_ID   = "6397743817"
 SCAN_INTERVAL_MINS = 15
 STABILITY_MIN      = 8
-ALERT_ON           = ["LONG GRID CANDIDATE", "SHORT GRID CANDIDATE"]
+
+PRIMARY_ALERTS   = ["LONG GRID CANDIDATE", "SHORT GRID CANDIDATE", "GRID INVALIDATED"]
+SECONDARY_ALERTS = []
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(), logging.FileHandler("scanner.log")])
@@ -111,7 +113,6 @@ def analyse(cs, price):
     elif ci<45  and olap<0.30 and strong_dir:        state="strong_trend"; s_mkt=0
     elif ci<52  and abs_slope>3.0:                   state="trending";     s_mkt=3
     else:                                             state="mixed";        s_mkt=5
-    trend_dir="UP" if ema20_slope>1.5 else "DOWN" if ema20_slope<-1.5 else "FLAT"
     lb=cs[-min(72,N):]; sw=min(3,max(1,len(lb)//10))
     lows,highs=swing_points(lb,sw); tol=atr14*0.6
     sup_cl=cluster(lows,tol); res_cl=cluster(highs,tol)
@@ -129,6 +130,12 @@ def analyse(cs, price):
     elif (sup_t>=1 or res_t>=1) and inside_pct>0.50: rng_q="developing"
     else:                                             rng_q="weak"
     pos=max(0.0,min(1.0,(price-floor)/(ceiling-floor)))
+    pos_pct = round(pos*100, 0)
+    if   pos_pct <= 20: pos_label = f"LOWER {int(pos_pct)}% (ideal for long)"
+    elif pos_pct <= 40: pos_label = f"LOWER-MID {int(pos_pct)}% (acceptable)"
+    elif pos_pct <= 60: pos_label = f"MIDDLE {int(pos_pct)}% (neutral)"
+    elif pos_pct <= 80: pos_label = f"UPPER-MID {int(pos_pct)}% (avoid long)"
+    else:               pos_label = f"TOP {int(pos_pct)}% (avoid long)"
     if   pos<0.20: zone="lower_third"
     elif pos<0.40: zone="lower_mid"
     elif pos<0.60: zone="middle"
@@ -149,9 +156,9 @@ def analyse(cs, price):
     s_stab=10 if stab_r>=1 else (7 if stab_r>=0.7 else (4 if stab_r>=0.4 else 1))
     score_long =round(s_pm*.20+s_mkt*.25+s_rng*.25+s_el*.20+s_stab*.10,1)
     score_short=round(s_pm*.20+s_mkt*.25+s_rng*.25+s_es*.20+s_stab*.10,1)
-    if   width>10 or rng_q=="developing": grid_style="WIDE & DEFENSIVE"
-    elif width>=5:                          grid_style="MEDIUM & BALANCED"
-    else:                                   grid_style="TIGHT & AGGRESSIVE"
+    if   width>10 or rng_q=="developing": grid_style="WIDE (defensive)"
+    elif width>=5:                          grid_style="MEDIUM (balanced)"
+    else:                                   grid_style="TIGHT (aggressive)"
     inv_long =floor   - 0.5*atr14
     inv_short=ceiling + 0.5*atr14
     bad=state in("strong_trend","trending") or rng_q=="weak" or max(score_long,score_short)<5
@@ -166,100 +173,93 @@ def analyse(cs, price):
     elif short_ok:  verdict="SHORT GRID CANDIDATE"
     elif max(score_long,score_short)>=5: verdict="WATCH — NOT READY"
     else:           verdict="NO TRADE"
+    reasons = []
+    if pm_status.endswith("_complete") and slowing: reasons.append("Dump completed")
+    elif pm_status=="none": reasons.append("No prior impulse")
+    else: reasons.append("Move still ongoing")
+    if slowing: reasons.append("Momentum slowing")
+    if sup_t>=2: reasons.append(f"Strong support tested {sup_t}x")
+    elif sup_t==1: reasons.append("Support tested 1x (developing)")
+    if state=="sideways": reasons.append("Market sideways")
+    elif state=="weak_trend": reasons.append("Weak trend (acceptable)")
+    else: reasons.append(f"Market {state}")
     return dict(verdict=verdict,score_long=score_long,score_short=score_short,
-        state=state,ci=round(ci,1),olap=round(olap*100,0),trend_dir=trend_dir,
+        state=state,ci=round(ci,1),olap=round(olap*100,0),
         pm_status=pm_status,move_pct=round(move_pct,1),threshold=round(threshold,1),
         momentum=momentum,slow_count=slow_count,floor=floor,ceiling=ceiling,mid=mid,
         width=round(width,1),rng_q=rng_q,sup_t=sup_t,res_t=res_t,
-        inside_pct=round(inside_pct*100,0),pos=round(pos*100,1),zone=zone,
+        inside_pct=round(inside_pct*100,0),pos=pos_pct,pos_label=pos_label,zone=zone,
         long_q=long_q,short_q=short_q,stab_count=stab_count,stab_ok=stab_ok,
-        grid_style=grid_style,inv_long=inv_long,inv_short=inv_short,atr14=atr14)
+        grid_style=grid_style,inv_long=inv_long,inv_short=inv_short,atr14=atr14,reasons=reasons)
 
 def send_telegram(text):
     try:
         r=requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"Markdown",
                   "disable_web_page_preview":True}, timeout=15)
-        if r.status_code==200: log.info("Telegram ✓"); return True
+        if r.status_code==200: log.info("Telegram sent"); return True
         else: log.error(f"Telegram {r.status_code}: {r.text[:150]}"); return False
     except Exception as e:
         log.error(f"Telegram: {e}"); return False
 
 def build_alert(label, price, change, a):
-    chg_str=(f"+{change:.2f}%" if change>=0 else f"{change:.2f}%")
-    score=max(a["score_long"],a["score_short"])
-    ve={"LONG GRID CANDIDATE":"🟢","SHORT GRID CANDIDATE":"🟣",
-        "WATCH — NOT READY":"🟡","NO TRADE":"🔴"}.get(a["verdict"],"⚪")
-    sl={"sideways":"SIDEWAYS ✅","weak_trend":"WEAK TREND 🟡","mixed":"MIXED 🟡",
-        "trending":"TRENDING ❌","strong_trend":"STRONG TREND ❌"}.get(a["state"],a["state"])
-    pl={"none":"No impulse","impulse_up_complete":"Pump complete ✅",
-        "impulse_down_complete":"Dump complete ✅","impulse_up_ongoing":"Pump ongoing ❌",
-        "impulse_down_ongoing":"Dump ongoing ❌"}.get(a["pm_status"],a["pm_status"])
+    chg_str = (f"+{change:.2f}%" if change>=0 else f"{change:.2f}%")
+    score = max(a["score_long"], a["score_short"])
+    score_label = "Ideal" if score>=8.5 else "Strong" if score>=7.5 else "Good" if score>=6.5 else "Average"
+    ve = {"LONG GRID CANDIDATE":"🟢","SHORT GRID CANDIDATE":"🟣",
+          "WATCH — NOT READY":"🟡","NO TRADE":"🔴","GRID INVALIDATED":"⚡"}.get(a["verdict"],"⚪")
+    verdict_line = "GOOD SETUP — READY" if a["verdict"] in ("LONG GRID CANDIDATE","SHORT GRID CANDIDATE") else a["verdict"]
+    reasons_text = "\n".join([f"— {r}" for r in a["reasons"]])
+    entry_low  = a["floor"] + (a["ceiling"]-a["floor"])*0.05
+    entry_high = a["floor"] + (a["ceiling"]-a["floor"])*0.20
     return "\n".join([
-        f"{ve} *{a['verdict']} — {label}/USDT*",
-        f"{'━'*22}",
-        f"💰 *${price:,.0f}* ({chg_str}) | Score: *{score}/10*",
+        f"{ve} *{label}/USDT — {a['verdict']}*",
         f"",
-        f"*Prior Move:* {pl}",
-        f"  Move {a['move_pct']}% vs threshold {a['threshold']}% | Momentum: {a['momentum'].upper()}",
-        f"  Slowing signals: {a['slow_count']}/3",
+        f"Score: *{score} / 10* ({score_label})",
         f"",
-        f"*Market:* {sl}",
-        f"  Choppiness: {a['ci']} | Overlap: {a['olap']}% | EMA: {a['trend_dir']}",
+        f"Range: *${a['floor']:,.0f} — ${a['ceiling']:,.0f}*",
+        f"Position in range: *{a['pos_label']}*",
         f"",
-        f"*Range:* ${a['floor']:,.0f} → ${a['ceiling']:,.0f} ({a['width']}%)",
-        f"  Support: {a['sup_t']} tests | Resistance: {a['res_t']} tests | Clarity: {a['rng_q'].upper()}",
-        f"  {a['inside_pct']}% of last 20 candles inside range",
+        f"Grid Style: *{a['grid_style']}*",
         f"",
-        f"*Entry:* {a['pos']}% into range ({a['zone'].replace('_',' ')})",
-        f"  Long: {a['long_q'].upper()} | Short: {a['short_q'].upper()}",
+        f"Reason:",
+        f"{reasons_text}",
         f"",
-        f"*Stability:* {a['stab_count']}/{STABILITY_MIN} candles {'✅' if a['stab_ok'] else '⏳'}",
-        f"*Grid style:* {a['grid_style']}",
+        f"Entry Zone: *${entry_low:,.0f} — ${entry_high:,.0f}*",
+        f"Invalidation: Below *${a['inv_long']:,.0f}*",
         f"",
-        f"*Invalidation:*",
-        f"  Long invalid below ${a['inv_long']:,.0f}",
-        f"  Short invalid above ${a['inv_short']:,.0f}",
+        f"Verdict: *{verdict_line}*",
         f"",
-        f"{'━'*22}",
-        f"🕐 {datetime.now().strftime('%H:%M  %d/%m/%Y')}",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Price: ${price:,.0f} ({chg_str})",
+        f"Time: {datetime.now().strftime('%H:%M  %d/%m/%Y')}",
         f"_Not financial advice_",
     ])
 
 def run_scan():
-    log.info(f"{'─'*52}")
     log.info(f"Scan — {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}")
     for asset in ASSETS:
         label=asset["label"]; sym=asset["symbol"]
-        log.info(f"Fetching {label}...")
         cs=fetch_candles(sym,"4h",120); tk=fetch_ticker(sym)
         if cs is None or tk is None:
-            log.error(f"{label}: fetch failed — check internet"); continue
-        if len(cs)<20:
-            log.warning(f"{label}: only {len(cs)} candles, skipping"); continue
+            log.error(f"{label}: fetch failed"); continue
+        if len(cs)<20: continue
         price=tk["price"]; change=tk["change"]
         a=analyse(cs,price)
-        log.info(f"{label}: ${price:,.0f} ({change:+.2f}%) | {a['verdict']} | "
-                 f"L:{a['score_long']} S:{a['score_short']} | {a['state'].upper()} "
-                 f"CI:{a['ci']} | ${a['floor']:,.0f}-${a['ceiling']:,.0f} ({a['rng_q']}) | "
-                 f"Pos:{a['pos']}% | Stab:{a['stab_count']}/{STABILITY_MIN}")
-        if a["verdict"] in ALERT_ON:
-            log.info(f"  → Alert triggered!")
+        log.info(f"{label}: ${price:,.0f} | {a['verdict']} | L:{a['score_long']} S:{a['score_short']} | Pos:{a['pos']}%")
+        if a["verdict"] in PRIMARY_ALERTS:
             send_telegram(build_alert(label,price,change,a))
-        else:
-            log.info(f"  → No alert ({a['verdict']})")
-    log.info("Scan complete.\n")
+    log.info("Done.\n")
 
 if __name__=="__main__":
-    log.info("Grid Range Scanner starting...")
     send_telegram(
-        "🤖 *Grid Range Scanner ONLINE*\n"
+        "🤖 *Grid Range Scanner v2 ONLINE*\n"
         "━━━━━━━━━━━━━━━━\n"
         "BTC & ETH · 4H candles\n"
-        f"Scan every {SCAN_INTERVAL_MINS} minutes\n"
+        f"Every {SCAN_INTERVAL_MINS} minutes\n"
         "_Not financial advice_"
     )
     run_scan()
     while True:
-        log.info(f"Next scan in {SCAN_INTERVAL_MINS} minutes...")
         time.sleep(SCAN_INTERVAL_MINS*60)
+        run_scan()
